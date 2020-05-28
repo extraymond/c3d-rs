@@ -1,4 +1,6 @@
+use anyhow::Result;
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::fs::File;
 use std::io;
 use std::io::prelude::*;
@@ -14,29 +16,203 @@ use std::fmt;
 pub enum ParserError {
     #[error("magic word not unmatched, might not be a c3d file")]
     UnmatchMagic,
+    #[error("unable to parse paramter file")]
+    ParseParameterError,
+    #[error("io error")]
+    IoError(#[from] io::Error),
 }
 
+#[derive(Default)]
 pub struct C3d {
-    pub header: Header,
-    pub parameter: Vec<Parameter>,
-    pub data: Vec<Data>,
+    pub header: Option<Header>,
+    pub parameter: Option<ParameterBlock>,
+    pub data: Vec<(u16, PointData, Option<AnalogData>)>,
 }
 
 impl C3d {
-    pub fn read_bytes(bytes: &[u8]) -> Result<C3d, ParserError> {
-        femme::with_level(log::LevelFilter::Info);
-        let parameter_start = bytes[0];
-        log::info!("parameter start: {}", parameter_start);
+    pub fn get_header<T>(&mut self, r: &mut T) -> Result<()>
+    where
+        T: Seek + Read,
+    {
+        r.seek(SeekFrom::Start(0))?;
+        let header = Header::from_reader(r);
+        self.header.replace(header);
 
-        let magic_word = bytes[1];
+        Ok(())
+    }
 
-        if magic_word == 80 {
-            return Err(ParserError::UnmatchMagic);
+    pub fn get_parameter<T>(&mut self, r: &mut T) -> Result<(), ParserError>
+    where
+        T: Seek + Read,
+    {
+        if let Some(header) = self.header.as_ref() {
+            r.seek(SeekFrom::Start((header.parameter_start as u64 - 1) * 512))?;
+            let parameter_block = ParameterBlock::from_reader(r);
+            self.parameter.replace(parameter_block);
+            Ok(())
+        } else {
+            Err(ParserError::ParseParameterError)
+        }
+    }
+
+    pub fn read_frames<T>(&mut self, r: &mut T) -> Result<(), ParserError>
+    where
+        T: Seek + Read,
+    {
+        if let Some(header) = self.header.as_ref() {
+            if let Some(parameter) = self.parameter.as_ref() {
+                r.seek(SeekFrom::Start((header.data_start as u64 - 1) * 512))?;
+                let mut points_buffer: Vec<u8> = vec![];
+                let mut analog_buffer: Vec<u8> = vec![];
+
+                let scale = header.scale;
+
+                let is_float = scale < 0.0;
+                let scale = scale.abs();
+
+                let point_scale = if is_float { scale } else { 1.0 };
+                let point_data_length = if is_float { 4 } else { 2 };
+
+                let analog_data_length = if is_float { 4 } else { 2 };
+
+                let is_unsigned = parameter
+                    .get("ANALOG:FORMAT")
+                    .map(|param| {
+                        param
+                            .parameter_data
+                            .values
+                            .iter()
+                            .filter_map(|v| v.as_char())
+                            .filter(|c| !c.is_whitespace())
+                            .collect::<String>()
+                    })
+                    .and(Some("UNSIGNED"))
+                    .is_some();
+
+                let points_n = 4 * header.point_counts;
+                let analog_n = header.analog_counts;
+                for frame_idx in header.frame_first..=header.frame_last {
+                    points_buffer.resize((points_n * point_data_length) as usize, 0_u8);
+                    r.read_exact(&mut points_buffer[..])?;
+
+                    let values: Vec<Box<dyn DataValue>> = points_buffer
+                        .chunks_exact(if is_float { 4 } else { 2 })
+                        .filter_map(|arr| {
+                            Some(if is_float {
+                                let mut buf = [0_u8; 4];
+                                (arr.clone()).read_exact(&mut buf).unwrap();
+                                Box::new(f32::from_le_bytes(buf) * point_scale)
+                                    as Box<dyn DataValue>
+                            } else {
+                                let mut buf = [0_u8; 2];
+                                (arr.clone()).read_exact(&mut buf).unwrap();
+                                Box::new(i16::from_le_bytes(buf) * point_scale as i16)
+                            })
+                        })
+                        .collect();
+
+                    let values = values
+                        .chunks_exact(4)
+                        .map(|v| v.iter().map(|v| v.clone_box()).collect())
+                        .collect();
+
+                    let points_data = PointData { values };
+                    let analog_data = if header.analog_counts > 0 {
+                        analog_buffer.resize((analog_n * analog_data_length) as usize, 0_u8);
+                        r.read_exact(&mut points_buffer[..])?;
+
+                        let values: Vec<Vec<Box<dyn AnalogValue>>> = points_buffer
+                            .chunks_exact(if is_float { 4 } else { 2 })
+                            .filter_map(|arr| {
+                                Some(if is_float {
+                                    let mut buf = [0_u8; 4];
+                                    (arr.clone()).read_exact(&mut buf).unwrap();
+                                    Box::new(f32::from_le_bytes(buf)) as Box<dyn AnalogValue>
+                                } else {
+                                    if is_unsigned {
+                                        let mut buf = [0_u8; 2];
+                                        (arr.clone()).read_exact(&mut buf).unwrap();
+                                        Box::new(u16::from_le_bytes(buf)) as Box<dyn AnalogValue>
+                                    } else {
+                                        let mut buf = [0_u8; 2];
+                                        (arr.clone()).read_exact(&mut buf).unwrap();
+                                        Box::new(i16::from_le_bytes(buf)) as Box<dyn AnalogValue>
+                                    }
+                                })
+                            })
+                            .map(|v| vec![v])
+                            .collect();
+                        Some(AnalogData { values })
+                    } else {
+                        None
+                    };
+
+                    self.data.push((frame_idx, points_data, analog_data));
+                }
+            }
         }
 
-        unimplemented!()
+        Ok(())
+    }
+
+    pub fn get_point_lables(&self) -> Option<Vec<String>> {
+        let mut rv = None;
+        if let Some(parameter) = self.parameter.as_ref() {
+            rv = parameter.get("POINT:LABELS").map(|param| {
+                param
+                    .parameter_data
+                    .values
+                    .chunks_exact(param.dimensions[0] as usize)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_char())
+                            .filter(|c| !c.is_whitespace())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<String>>()
+            });
+        }
+        rv
+    }
+
+    pub fn get_analog_lables(&self) -> Option<Vec<String>> {
+        let mut rv = None;
+        if let Some(parameter) = self.parameter.as_ref() {
+            if let Some(analog) = parameter.groups.get("ANALOG") {
+                let mut keys = analog
+                    .params
+                    .keys()
+                    .filter_map(|v| if v.contains("LABEL") { Some(v) } else { None })
+                    .collect::<Vec<_>>();
+
+                keys.sort();
+
+                rv = Some(
+                    keys.iter()
+                        .filter_map(|v| {
+                            parameter.get(&format!("ANALOG:{}", v)).map(|param| {
+                                param
+                                    .parameter_data
+                                    .values
+                                    .chunks_exact(param.dimensions[0] as usize)
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|c| c.as_char())
+                                            .filter(|c| !c.is_whitespace())
+                                            .collect::<String>()
+                                    })
+                                    .collect::<Vec<String>>()
+                            })
+                        })
+                        .flatten()
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        rv
     }
 }
+pub struct Data;
 
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
@@ -165,10 +341,27 @@ impl FromReader for ParameterBlock {
                 let mut data_buffer = vec![0_u8; total_data_length as usize];
                 parameter_block_cursor.read_exact(&mut data_buffer).unwrap();
 
-                let datas: Vec<ParameterData> = data_buffer
+                let datas: Vec<Box<dyn ParamValue>> = data_buffer
                     .chunks_exact(data_length.abs() as usize)
-                    .map(|arr| ParameterData::from_array(data_length, arr).unwrap())
+                    .filter_map(|arr| match data_length {
+                        1 => Some(Box::new(arr[0] as u8) as Box<dyn ParamValue>),
+                        2 => {
+                            let mut buf = [0_u8; 2];
+                            (arr.clone()).read_exact(&mut buf).unwrap();
+                            let val = i16::from_le_bytes(buf);
+                            Some(Box::new(val) as Box<dyn ParamValue>)
+                        }
+                        4 => {
+                            let mut buf = [0_u8; 4];
+                            (arr.clone()).read_exact(&mut buf).unwrap();
+                            let val = f32::from_le_bytes(buf);
+                            Some(Box::new(val))
+                        }
+                        -1 => Some(Box::new(arr[0] as char) as Box<dyn ParamValue>),
+                        _ => None,
+                    })
                     .collect();
+                let param_data = ParamData { values: datas };
 
                 parameter_block_cursor.read_exact(&mut u8_buffer).unwrap();
                 let desc_chars_size = u8_buffer[0];
@@ -183,7 +376,7 @@ impl FromReader for ParameterBlock {
                     data_length,
                     num_dimensions,
                     dimensions,
-                    parameter_data: datas,
+                    parameter_data: param_data,
                     desc_chars_size,
                     description: desc,
                 };
@@ -304,7 +497,7 @@ pub struct ParameterFormat {
     data_length: i8,
     num_dimensions: u8,
     dimensions: Vec<u8>,
-    parameter_data: Vec<ParameterData>,
+    parameter_data: ParamData,
     desc_chars_size: u8,
     description: String,
 }
@@ -322,75 +515,163 @@ pub struct Parameter {
     description: String,
 }
 
-#[derive(Debug, Clone)]
-pub enum ParameterData {
-    Character(char),
-    Bytes(u8),
-    Integer(i16),
-    Float(f32),
+#[derive(Debug)]
+pub struct ParamData {
+    pub values: Vec<Box<dyn ParamValue>>,
 }
 
-impl ParameterData {
-    pub fn from_array(data_length: i8, arr: &[u8]) -> Option<Self> {
-        match data_length {
-            -1 => {
-                let content = arr[0] as char;
-                Some(ParameterData::Character(content))
-            }
-            1 => Some(ParameterData::Bytes(arr[0])),
-            2 => {
-                let mut buf = [0_u8; 2];
-                arr.clone().read_exact(&mut buf).unwrap();
-                Some(ParameterData::Integer(i16::from_le_bytes(buf)))
-            }
-            4 => {
-                let mut buf = [0_u8; 4];
-                arr.clone().read_exact(&mut buf).unwrap();
-                Some(ParameterData::Float(f32::from_le_bytes(buf)))
-            }
-            _ => None,
-        }
+#[derive(Debug)]
+pub struct PointData {
+    pub values: Vec<Vec<Box<dyn DataValue>>>,
+}
+
+#[derive(Debug)]
+pub struct AnalogData {
+    pub values: Vec<Vec<Box<dyn AnalogValue>>>,
+}
+
+pub trait ParamValue: std::fmt::Debug + ParamClone {
+    fn as_char(&self) -> Option<&char> {
+        None
+    }
+    fn as_f32(&self) -> Option<&f32> {
+        None
+    }
+    fn as_i16(&self) -> Option<&i16> {
+        None
+    }
+    fn as_u8(&self) -> Option<&u8> {
+        None
     }
 }
 
-pub struct Data {}
+pub trait ParamClone {
+    fn clone_box(&self) -> Box<dyn ParamValue>;
+}
+
+impl<T> ParamClone for T
+where
+    T: 'static + ParamValue + Clone,
+{
+    fn clone_box(&self) -> Box<dyn ParamValue> {
+        Box::new(self.clone())
+    }
+}
+
+impl ParamValue for char {
+    fn as_char(&self) -> Option<&char> {
+        Some(self)
+    }
+}
+impl ParamValue for f32 {
+    fn as_f32(&self) -> Option<&f32> {
+        Some(self)
+    }
+}
+
+impl ParamValue for i16 {
+    fn as_i16(&self) -> Option<&i16> {
+        Some(&self)
+    }
+}
+
+impl ParamValue for u8 {
+    fn as_u8(&self) -> Option<&u8> {
+        Some(&self)
+    }
+}
+
+pub trait DataClone {
+    fn clone_box(&self) -> Box<dyn DataValue>;
+}
+
+impl<T> DataClone for T
+where
+    T: 'static + DataValue + Clone,
+{
+    fn clone_box(&self) -> Box<dyn DataValue> {
+        Box::new(self.clone())
+    }
+}
+
+pub trait DataValue: std::fmt::Debug + DataClone {
+    fn as_f32(&self) -> Option<&f32> {
+        None
+    }
+    fn as_i16(&self) -> Option<&i16> {
+        None
+    }
+}
+
+impl DataValue for f32 {
+    fn as_f32(&self) -> Option<&f32> {
+        Some(self)
+    }
+}
+impl DataValue for i16 {
+    fn as_i16(&self) -> Option<&i16> {
+        Some(self)
+    }
+}
+
+pub trait AnalogClone {
+    fn clone_box(&self) -> Box<dyn AnalogValue>;
+}
+
+impl<T> AnalogClone for T
+where
+    T: 'static + AnalogValue + Clone,
+{
+    fn clone_box(&self) -> Box<dyn AnalogValue> {
+        Box::new(self.clone())
+    }
+}
+
+pub trait AnalogValue: std::fmt::Debug {
+    fn as_f32(&self) -> Option<&f32> {
+        None
+    }
+    fn as_i16(&self) -> Option<&i16> {
+        None
+    }
+    fn as_u16(&self) -> Option<&u16> {
+        None
+    }
+}
+
+impl AnalogValue for f32 {
+    fn as_f32(&self) -> Option<&f32> {
+        Some(self)
+    }
+}
+impl AnalogValue for u16 {
+    fn as_u16(&self) -> Option<&u16> {
+        Some(self)
+    }
+}
+impl AnalogValue for i16 {
+    fn as_i16(&self) -> Option<&i16> {
+        Some(self)
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
-    fn test_magic() {
-        let user = std::env::var("USER").unwrap();
-        let mut file = File::open(format!("/home/{}/Downloads/takes/001.c3d", user)).unwrap();
+    fn test_magic() -> Result<()> {
+        let user = std::env::var("USER")?;
+        let mut file = File::open(format!("/home/{}/Downloads/takes/001.c3d", user))?;
 
-        let header = Header::from_reader(&mut file);
-        assert_eq!(header.magic_word, 80);
+        let mut adapter = C3d::default();
+        adapter.get_header(&mut file)?;
+        adapter.get_parameter(&mut file)?;
+        adapter.read_frames(&mut file)?;
 
-        let parameter = ParameterHeader::from_reader(&mut file);
-        assert_eq!(parameter.magic_number, 84);
+        // dbg!(adapter.get_point_lables());
+        dbg!(adapter.get_analog_lables());
 
-        file.seek(SeekFrom::Current(-4)).unwrap();
-        let parameter_block = ParameterBlock::from_reader(&mut file);
-
-        let param_datas = parameter_block.get("POINT:LABELS").unwrap();
-        let lables = param_datas
-            .parameter_data
-            .chunks_exact(param_datas.dimensions[0] as usize)
-            .map(|arr| {
-                arr.iter()
-                    .map(|v| {
-                        if let ParameterData::Character(c) = v {
-                            Some(c)
-                        } else {
-                            None
-                        }
-                    })
-                    .map(|el| el.unwrap())
-                    .collect::<String>()
-            })
-            .collect::<Vec<String>>();
-        dbg!(lables);
+        Ok(())
     }
 }
