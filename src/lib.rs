@@ -96,7 +96,7 @@ impl C3d {
                     r.read_exact(&mut points_buffer[..])?;
 
                     let values: Vec<Box<dyn DataValue>> = points_buffer
-                        .chunks_exact(if is_float { 4 } else { 2 })
+                        .chunks_exact(point_data_length as usize)
                         .filter_map(|arr| {
                             Some(if is_float {
                                 let mut buf = [0_u8; 4];
@@ -119,22 +119,21 @@ impl C3d {
                     let points_data = PointData { values };
                     let analog_data = if header.analog_counts > 0 {
                         analog_buffer.resize((analog_n * analog_data_length) as usize, 0_u8);
-                        r.read_exact(&mut points_buffer[..])?;
+                        r.read_exact(&mut analog_buffer[..])?;
 
-                        let values: Vec<Vec<Box<dyn AnalogValue>>> = points_buffer
-                            .chunks_exact(if is_float { 4 } else { 2 })
+                        let values: Vec<Vec<Box<dyn AnalogValue>>> = analog_buffer
+                            .chunks_exact(analog_data_length as usize)
                             .filter_map(|arr| {
                                 Some(if is_float {
                                     let mut buf = [0_u8; 4];
                                     (arr.clone()).read_exact(&mut buf).unwrap();
                                     Box::new(f32::from_le_bytes(buf)) as Box<dyn AnalogValue>
                                 } else {
+                                    let mut buf = [0_u8; 2];
                                     if is_unsigned {
-                                        let mut buf = [0_u8; 2];
                                         (arr.clone()).read_exact(&mut buf).unwrap();
                                         Box::new(u16::from_le_bytes(buf)) as Box<dyn AnalogValue>
                                     } else {
-                                        let mut buf = [0_u8; 2];
                                         (arr.clone()).read_exact(&mut buf).unwrap();
                                         Box::new(i16::from_le_bytes(buf)) as Box<dyn AnalogValue>
                                     }
@@ -209,6 +208,42 @@ impl C3d {
                 );
             }
         }
+        rv
+    }
+
+    pub fn get_point_data(&self, point_name: &str) -> Option<Vec<&Vec<Box<dyn DataValue>>>> {
+        let mut rv = None;
+
+        if let Some(point_labels) = self.get_point_lables() {
+            if let Some(idx) = point_labels.iter().position(|v| v == point_name) {
+                rv = Some(
+                    self.data
+                        .iter()
+                        .map(|v| &v.1)
+                        .filter_map(|v| v.values.get(idx))
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+
+        rv
+    }
+
+    pub fn get_analog_data(&self, channel_name: &str) -> Option<Vec<&Vec<Box<dyn AnalogValue>>>> {
+        let mut rv = None;
+
+        if let Some(analog_labels) = self.get_analog_lables() {
+            if let Some(idx) = analog_labels.iter().position(|v| v == channel_name) {
+                rv = Some(
+                    self.data
+                        .iter()
+                        .filter_map(|v| v.2.as_ref())
+                        .filter_map(|v| v.values.get(idx))
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+
         rv
     }
 }
@@ -670,7 +705,11 @@ mod tests {
         adapter.read_frames(&mut file)?;
 
         // dbg!(adapter.get_point_lables());
-        dbg!(adapter.get_analog_lables());
+        // dbg!(adapter.get_analog_lables().unwrap().len());
+
+        // dbg!(adapter.get_point_data("LeftFinger").unwrap().len());
+        let tracker_data = adapter.get_analog_data("Tracker0_Bqz").unwrap();
+        dbg!(tracker_data);
 
         Ok(())
     }
