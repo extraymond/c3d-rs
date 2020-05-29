@@ -703,8 +703,7 @@ mod tests {
 
     #[test]
     fn test_magic() -> Result<()> {
-        let user = std::env::var("USER")?;
-        let mut file = File::open(format!("/home/{}/Downloads/takes/001.c3d", user))?;
+        let mut file = File::open("test_data/001.c3d")?;
 
         let mut adapter = C3dAdapter::default();
         adapter.get_header(&mut file)?;
