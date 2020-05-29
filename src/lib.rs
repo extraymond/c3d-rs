@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::collections::HashMap;
-use std::convert::TryInto;
+
 use std::fs::File;
 use std::io;
 use std::io::prelude::*;
@@ -9,8 +9,6 @@ use std::io::SeekFrom;
 use std::mem;
 use std::slice;
 use thiserror::Error;
-
-use std::fmt;
 
 #[derive(Error, Debug)]
 pub enum ParserError {
@@ -23,19 +21,159 @@ pub enum ParserError {
 }
 
 #[derive(Default)]
-pub struct C3d {
-    pub header: Option<Header>,
+pub struct C3dAdapter {
+    pub header: Option<HeaderBlock>,
     pub parameter: Option<ParameterBlock>,
-    pub data: Vec<(u16, PointData, Option<AnalogData>)>,
 }
 
-impl C3d {
+pub struct C3dReader<'a, 'b, R: Read + Seek> {
+    header: &'a HeaderBlock,
+    parameter: &'a ParameterBlock,
+    handle: &'b mut R,
+    points_buffer: Vec<u8>,
+    analog_buffer: Vec<u8>,
+    frame_idx: u16,
+}
+
+impl<'a, 'b, R: Read + Seek> C3dReader<'a, 'b, R> {
+    pub fn new(
+        header: &'a HeaderBlock,
+        parameter: &'a ParameterBlock,
+        handle: &'b mut R,
+    ) -> Result<Self, ParserError> {
+        handle.seek(SeekFrom::Start((header.data_start as u64 - 1) * 512))?;
+        let points_buffer: Vec<u8> = vec![];
+        let analog_buffer: Vec<u8> = vec![];
+
+        Ok(C3dReader {
+            header,
+            parameter,
+            handle,
+            points_buffer,
+            analog_buffer,
+            frame_idx: header.frame_first,
+        })
+    }
+}
+
+impl<'a, 'b, R: Read + Seek> Iterator for C3dReader<'a, 'b, R> {
+    type Item = (u16, PointData, Option<AnalogData>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.frame_idx > self.header.frame_last {
+            return None;
+        }
+
+        let point_scale = self.header.scale;
+        let is_float = point_scale < 0.0;
+
+        let point_data_length = if is_float { 4 } else { 2 };
+        let point_scale = if is_float { point_scale.abs() } else { 1.0 };
+
+        let analog_data_length = if is_float { 4 } else { 2 };
+        let is_unsigned = self
+            .parameter
+            .get("ANALOG:FORMAT")
+            .map(|param| {
+                param
+                    .parameter_data
+                    .values
+                    .iter()
+                    .filter_map(|v| v.as_char())
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>()
+            })
+            .and(Some("UNSIGNED"))
+            .is_some();
+
+        let points_n = 4 * self.header.point_counts;
+        let analog_n = self.header.analog_counts;
+
+        self.points_buffer
+            .resize((points_n * point_data_length) as usize, 0_u8);
+
+        if self.handle.read_exact(&mut self.points_buffer[..]).is_err() {
+            return None;
+        }
+
+        let values: Vec<Box<dyn DataValue>> = self
+            .points_buffer
+            .chunks_exact(point_data_length as usize)
+            .filter_map(|arr| {
+                Some(if is_float {
+                    let mut buf = [0_u8; 4];
+                    (arr.clone()).read_exact(&mut buf).unwrap();
+                    Box::new(f32::from_le_bytes(buf) * point_scale) as Box<dyn DataValue>
+                } else {
+                    let mut buf = [0_u8; 2];
+                    (arr.clone()).read_exact(&mut buf).unwrap();
+                    Box::new(i16::from_le_bytes(buf) * point_scale as i16)
+                })
+            })
+            .collect();
+
+        let values = values
+            .chunks_exact(4)
+            .map(|v| v.iter().map(|v| v.clone_box()).collect())
+            .collect();
+
+        let point_data = PointData { values };
+        let analog_data = if analog_n > 0 {
+            self.analog_buffer
+                .resize((analog_n * analog_data_length) as usize, 0_u8);
+            if self.handle.read_exact(&mut self.analog_buffer[..]).is_err() {
+                return None;
+            }
+
+            let values: Vec<Vec<Box<dyn AnalogValue>>> = self
+                .analog_buffer
+                .chunks_exact(analog_data_length as usize)
+                .filter_map(|arr| {
+                    Some(if is_float {
+                        let mut buf = [0_u8; 4];
+                        (arr.clone()).read_exact(&mut buf).unwrap();
+                        Box::new(f32::from_le_bytes(buf)) as Box<dyn AnalogValue>
+                    } else {
+                        let mut buf = [0_u8; 2];
+                        if is_unsigned {
+                            (arr.clone()).read_exact(&mut buf).unwrap();
+                            Box::new(u16::from_le_bytes(buf)) as Box<dyn AnalogValue>
+                        } else {
+                            (arr.clone()).read_exact(&mut buf).unwrap();
+                            Box::new(i16::from_le_bytes(buf)) as Box<dyn AnalogValue>
+                        }
+                    })
+                })
+                .map(|v| vec![v])
+                .collect();
+            Some(AnalogData { values })
+        } else {
+            None
+        };
+
+        let frame_idx = self.frame_idx;
+        self.frame_idx += 1;
+
+        Some((frame_idx, point_data, analog_data))
+    }
+}
+
+impl C3dAdapter {
+    pub fn from_file(path: &str) -> Result<Self> {
+        let mut file = File::open(path)?;
+        let mut adapter = C3dAdapter::default();
+        adapter.get_header(&mut file)?;
+        adapter.get_parameter(&mut file)?;
+
+        Ok(adapter)
+    }
+
     pub fn get_header<T>(&mut self, r: &mut T) -> Result<()>
     where
         T: Seek + Read,
     {
         r.seek(SeekFrom::Start(0))?;
-        let header = Header::from_reader(r);
+        let header = HeaderBlock::from_reader(r);
         self.header.replace(header);
 
         Ok(())
@@ -53,105 +191,6 @@ impl C3d {
         } else {
             Err(ParserError::ParseParameterError)
         }
-    }
-
-    pub fn read_frames<T>(&mut self, r: &mut T) -> Result<(), ParserError>
-    where
-        T: Seek + Read,
-    {
-        if let Some(header) = self.header.as_ref() {
-            if let Some(parameter) = self.parameter.as_ref() {
-                r.seek(SeekFrom::Start((header.data_start as u64 - 1) * 512))?;
-                let mut points_buffer: Vec<u8> = vec![];
-                let mut analog_buffer: Vec<u8> = vec![];
-
-                let scale = header.scale;
-
-                let is_float = scale < 0.0;
-                let scale = scale.abs();
-
-                let point_scale = if is_float { scale } else { 1.0 };
-                let point_data_length = if is_float { 4 } else { 2 };
-
-                let analog_data_length = if is_float { 4 } else { 2 };
-
-                let is_unsigned = parameter
-                    .get("ANALOG:FORMAT")
-                    .map(|param| {
-                        param
-                            .parameter_data
-                            .values
-                            .iter()
-                            .filter_map(|v| v.as_char())
-                            .filter(|c| !c.is_whitespace())
-                            .collect::<String>()
-                    })
-                    .and(Some("UNSIGNED"))
-                    .is_some();
-
-                let points_n = 4 * header.point_counts;
-                let analog_n = header.analog_counts;
-                for frame_idx in header.frame_first..=header.frame_last {
-                    points_buffer.resize((points_n * point_data_length) as usize, 0_u8);
-                    r.read_exact(&mut points_buffer[..])?;
-
-                    let values: Vec<Box<dyn DataValue>> = points_buffer
-                        .chunks_exact(point_data_length as usize)
-                        .filter_map(|arr| {
-                            Some(if is_float {
-                                let mut buf = [0_u8; 4];
-                                (arr.clone()).read_exact(&mut buf).unwrap();
-                                Box::new(f32::from_le_bytes(buf) * point_scale)
-                                    as Box<dyn DataValue>
-                            } else {
-                                let mut buf = [0_u8; 2];
-                                (arr.clone()).read_exact(&mut buf).unwrap();
-                                Box::new(i16::from_le_bytes(buf) * point_scale as i16)
-                            })
-                        })
-                        .collect();
-
-                    let values = values
-                        .chunks_exact(4)
-                        .map(|v| v.iter().map(|v| v.clone_box()).collect())
-                        .collect();
-
-                    let points_data = PointData { values };
-                    let analog_data = if header.analog_counts > 0 {
-                        analog_buffer.resize((analog_n * analog_data_length) as usize, 0_u8);
-                        r.read_exact(&mut analog_buffer[..])?;
-
-                        let values: Vec<Vec<Box<dyn AnalogValue>>> = analog_buffer
-                            .chunks_exact(analog_data_length as usize)
-                            .filter_map(|arr| {
-                                Some(if is_float {
-                                    let mut buf = [0_u8; 4];
-                                    (arr.clone()).read_exact(&mut buf).unwrap();
-                                    Box::new(f32::from_le_bytes(buf)) as Box<dyn AnalogValue>
-                                } else {
-                                    let mut buf = [0_u8; 2];
-                                    if is_unsigned {
-                                        (arr.clone()).read_exact(&mut buf).unwrap();
-                                        Box::new(u16::from_le_bytes(buf)) as Box<dyn AnalogValue>
-                                    } else {
-                                        (arr.clone()).read_exact(&mut buf).unwrap();
-                                        Box::new(i16::from_le_bytes(buf)) as Box<dyn AnalogValue>
-                                    }
-                                })
-                            })
-                            .map(|v| vec![v])
-                            .collect();
-                        Some(AnalogData { values })
-                    } else {
-                        None
-                    };
-
-                    self.data.push((frame_idx, points_data, analog_data));
-                }
-            }
-        }
-
-        Ok(())
     }
 
     pub fn get_point_lables(&self) -> Option<Vec<String>> {
@@ -211,47 +250,21 @@ impl C3d {
         rv
     }
 
-    pub fn get_point_data(&self, point_name: &str) -> Option<Vec<&Vec<Box<dyn DataValue>>>> {
-        let mut rv = None;
-
-        if let Some(point_labels) = self.get_point_lables() {
-            if let Some(idx) = point_labels.iter().position(|v| v == point_name) {
-                rv = Some(
-                    self.data
-                        .iter()
-                        .map(|v| &v.1)
-                        .filter_map(|v| v.values.get(idx))
-                        .collect::<Vec<_>>(),
-                );
-            }
-        }
-
-        rv
-    }
-
-    pub fn get_analog_data(&self, channel_name: &str) -> Option<Vec<&Vec<Box<dyn AnalogValue>>>> {
-        let mut rv = None;
-
-        if let Some(analog_labels) = self.get_analog_lables() {
-            if let Some(idx) = analog_labels.iter().position(|v| v == channel_name) {
-                rv = Some(
-                    self.data
-                        .iter()
-                        .filter_map(|v| v.2.as_ref())
-                        .filter_map(|v| v.values.get(idx))
-                        .collect::<Vec<_>>(),
-                );
-            }
-        }
-
-        rv
+    pub fn reader<'a, 'b, R: Seek + Read>(
+        &'a self,
+        handle: &'b mut R,
+    ) -> Result<C3dReader<'a, 'b, R>, ParserError> {
+        C3dReader::new(
+            self.header.as_ref().unwrap(),
+            self.parameter.as_ref().unwrap(),
+            handle,
+        )
     }
 }
-pub struct Data;
 
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
-pub struct Header {
+pub struct HeaderBlock {
     parameter_start: u8,
     magic_word: u8,
     point_counts: u16,
@@ -276,15 +289,15 @@ pub struct Header {
     reserved_four: [u8; 44],
 }
 
-pub trait FromReader {
+trait FromReader {
     fn from_reader<R: Read + Seek>(r: &mut R) -> Self;
 }
 
-impl FromReader for Header {
+impl FromReader for HeaderBlock {
     fn from_reader<R: Read + Seek>(r: &mut R) -> Self {
-        let mut header: Header = unsafe { mem::zeroed() };
+        let mut header: HeaderBlock = unsafe { mem::zeroed() };
         // dbg!(&header);
-        let header_size = mem::size_of::<Header>();
+        let header_size = mem::size_of::<HeaderBlock>();
 
         unsafe {
             // directly mutate the memory slice under Header.
@@ -298,9 +311,9 @@ impl FromReader for Header {
     }
 }
 
-impl FromReader for ParameterHeader {
+impl FromReader for ParameterBlockHeader {
     fn from_reader<R: Read + Seek>(r: &mut R) -> Self {
-        let mut parameter: ParameterHeader = unsafe { mem::zeroed() };
+        let mut parameter: ParameterBlockHeader = unsafe { mem::zeroed() };
 
         unsafe {
             let parameter_slice = slice::from_raw_parts_mut(&mut parameter as *mut _ as *mut u8, 4);
@@ -313,7 +326,7 @@ impl FromReader for ParameterHeader {
 
 impl FromReader for ParameterBlock {
     fn from_reader<R: Read + Seek>(r: &mut R) -> Self {
-        let header = ParameterHeader::from_reader(r);
+        let header = ParameterBlockHeader::from_reader(r);
 
         let mut u8_buffer = [0_u8];
         let mut i8_buffer = [0_u8];
@@ -325,7 +338,7 @@ impl FromReader for ParameterBlock {
         r.read_exact(&mut parameter_buf).unwrap();
         let mut parameter_block_cursor = Cursor::new(&parameter_buf[..]);
 
-        let mut groups = HashMap::<u8, Group>::new();
+        let mut groups = HashMap::<u8, GroupFormat>::new();
 
         loop {
             parameter_block_cursor.read_exact(&mut i8_buffer).unwrap();
@@ -421,7 +434,7 @@ impl FromReader for ParameterBlock {
                 if let Some(group) = groups.get_mut(&group_id) {
                     group.params.insert(name, param);
                 } else {
-                    let mut group = Group::default();
+                    let mut group = GroupFormat::default();
                     group.params.insert(name, param);
                     groups.insert(group_id, group);
                 }
@@ -436,7 +449,7 @@ impl FromReader for ParameterBlock {
                     group.name = name;
                     group.description = desc;
                 } else {
-                    let new_group = Group {
+                    let new_group = GroupFormat {
                         name,
                         description: desc,
                         ..Default::default()
@@ -449,7 +462,7 @@ impl FromReader for ParameterBlock {
             parameter_block_cursor = Cursor::new(&parameter_buf[..]);
         }
 
-        let groups: HashMap<String, Group> = groups
+        let groups: HashMap<String, GroupFormat> = groups
             .into_iter()
             .map(|(_, v)| (v.name.clone(), v))
             .collect();
@@ -462,8 +475,8 @@ impl FromReader for ParameterBlock {
 
 #[derive(Debug)]
 pub struct ParameterBlock {
-    header: ParameterHeader,
-    groups: HashMap<String, Group>,
+    header: ParameterBlockHeader,
+    groups: HashMap<String, GroupFormat>,
 }
 
 impl ParameterBlock {
@@ -494,7 +507,7 @@ impl ParameterBlock {
 
 #[repr(C, packed)]
 #[derive(Copy, Clone, Debug)]
-pub struct ParameterHeader {
+struct ParameterBlockHeader {
     reserved_one: u8,
     reserved_two: u8,
     parameter_block_counts: u8,
@@ -502,25 +515,25 @@ pub struct ParameterHeader {
 }
 
 // #[derive(Debug)]
-pub struct GroupParse {
-    name_chars_size: u8,
-    id: i8,
-    name: String,
-    offset: i16,
-    desc_chars_size: u8,
-    description: String,
-    params: HashMap<String, Parameter>,
-}
+// pub struct GroupParse {
+//     name_chars_size: u8,
+//     id: i8,
+//     name: String,
+//     offset: i16,
+//     desc_chars_size: u8,
+//     description: String,
+//     params: HashMap<String, Parameter>,
+// }
 
-pub struct GroupFormat {
-    // indicates "locked" if value is negative.
-    name_chars_size: i8,
-    id: i8,
-    name: String,
-    offset: i16,
-    desc_chars_size: u8,
-    description: String,
-}
+// pub struct GroupFormat {
+//     // indicates "locked" if value is negative.
+//     name_chars_size: i8,
+//     id: i8,
+//     name: String,
+//     offset: i16,
+//     desc_chars_size: u8,
+//     description: String,
+// }
 
 #[derive(Debug)]
 pub struct ParameterFormat {
@@ -538,16 +551,10 @@ pub struct ParameterFormat {
 }
 
 #[derive(Default, Debug)]
-pub struct Group {
+pub struct GroupFormat {
     name: String,
     description: String,
     params: HashMap<String, ParameterFormat>,
-}
-
-#[derive(Default, Debug)]
-pub struct Parameter {
-    name: String,
-    description: String,
 }
 
 #[derive(Debug)]
@@ -699,17 +706,23 @@ mod tests {
         let user = std::env::var("USER")?;
         let mut file = File::open(format!("/home/{}/Downloads/takes/001.c3d", user))?;
 
-        let mut adapter = C3d::default();
+        let mut adapter = C3dAdapter::default();
         adapter.get_header(&mut file)?;
         adapter.get_parameter(&mut file)?;
-        adapter.read_frames(&mut file)?;
 
-        // dbg!(adapter.get_point_lables());
-        // dbg!(adapter.get_analog_lables().unwrap().len());
-
-        // dbg!(adapter.get_point_data("LeftFinger").unwrap().len());
-        let tracker_data = adapter.get_analog_data("Tracker0_Bqz").unwrap();
-        dbg!(tracker_data);
+        for i in adapter
+            .reader(&mut file)?
+            .into_iter()
+            .filter_map(|val| val.2)
+        {
+            i.values
+                .iter()
+                .zip(adapter.get_analog_lables().unwrap().iter())
+                .filter(|(_, k)| k.contains("Tracker"))
+                .for_each(|v| {
+                    println!("{}: {:?}", v.1, &v.0[0]);
+                })
+        }
 
         Ok(())
     }
