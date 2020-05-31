@@ -1,12 +1,14 @@
 use anyhow::Result;
 use std::collections::HashMap;
 
+use std::cell::RefCell;
 use std::fs::File;
 use std::io;
 use std::io::prelude::*;
 use std::io::Cursor;
 use std::io::SeekFrom;
 use std::mem;
+use std::rc::Rc;
 use std::slice;
 use thiserror::Error;
 
@@ -18,30 +20,55 @@ pub enum ParserError {
     ParseParameterError,
     #[error("io error")]
     IoError(#[from] io::Error),
+    #[error("missing header/parameter")]
+    MissingField,
 }
 
-#[derive(Default)]
-pub struct C3dAdapter {
+pub struct C3dAdapter<T: Read + Seek> {
     pub header: Option<HeaderBlock>,
     pub parameter: Option<ParameterBlock>,
+    handle: Rc<RefCell<T>>,
 }
 
-pub struct C3dReader<'a, 'b, R: Read + Seek> {
+impl<T: Read + Seek> C3dAdapter<T> {
+    pub fn new(mut file: T) -> Result<Self> {
+        file.seek(SeekFrom::Start(0))?;
+        let handle = Rc::new(RefCell::new(file));
+
+        Ok(C3dAdapter {
+            header: None,
+            parameter: None,
+            handle,
+        })
+    }
+
+    pub fn construct(mut self) -> Result<Self> {
+        let header = HeaderBlock::from_reader(&mut *self.handle.borrow_mut());
+        let parameter = ParameterBlock::from_reader(&mut *self.handle.borrow_mut());
+
+        self.header.replace(header);
+        self.parameter.replace(parameter);
+
+        Ok(self)
+    }
+}
+
+pub struct C3dReader<'a, R: Read + Seek> {
     header: &'a HeaderBlock,
     parameter: &'a ParameterBlock,
-    handle: &'b mut R,
+    handle: std::cell::RefMut<'a, R>,
     points_buffer: Vec<u8>,
     analog_buffer: Vec<u8>,
     frame_idx: u16,
 }
 
-impl<'a, 'b, R: Read + Seek> C3dReader<'a, 'b, R> {
+impl<'a, R: Read + Seek> C3dReader<'a, R> {
     pub fn new(
         header: &'a HeaderBlock,
         parameter: &'a ParameterBlock,
-        handle: &'b mut R,
+        mut handle: std::cell::RefMut<'a, R>,
     ) -> Result<Self, ParserError> {
-        handle.seek(SeekFrom::Start((header.data_start as u64 - 1) * 512))?;
+        (*handle).seek(SeekFrom::Start((header.data_start as u64 - 1) * 512))?;
         let points_buffer: Vec<u8> = vec![];
         let analog_buffer: Vec<u8> = vec![];
 
@@ -56,7 +83,7 @@ impl<'a, 'b, R: Read + Seek> C3dReader<'a, 'b, R> {
     }
 }
 
-impl<'a, 'b, R: Read + Seek> Iterator for C3dReader<'a, 'b, R> {
+impl<'a, R: Read + Seek> Iterator for C3dReader<'a, R> {
     type Item = (u16, PointData, Option<AnalogData>);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -158,41 +185,7 @@ impl<'a, 'b, R: Read + Seek> Iterator for C3dReader<'a, 'b, R> {
     }
 }
 
-impl C3dAdapter {
-    pub fn from_file(path: &str) -> Result<Self> {
-        let mut file = File::open(path)?;
-        let mut adapter = C3dAdapter::default();
-        adapter.get_header(&mut file)?;
-        adapter.get_parameter(&mut file)?;
-
-        Ok(adapter)
-    }
-
-    pub fn get_header<T>(&mut self, r: &mut T) -> Result<()>
-    where
-        T: Seek + Read,
-    {
-        r.seek(SeekFrom::Start(0))?;
-        let header = HeaderBlock::from_reader(r);
-        self.header.replace(header);
-
-        Ok(())
-    }
-
-    pub fn get_parameter<T>(&mut self, r: &mut T) -> Result<(), ParserError>
-    where
-        T: Seek + Read,
-    {
-        if let Some(header) = self.header.as_ref() {
-            r.seek(SeekFrom::Start((header.parameter_start as u64 - 1) * 512))?;
-            let parameter_block = ParameterBlock::from_reader(r);
-            self.parameter.replace(parameter_block);
-            Ok(())
-        } else {
-            Err(ParserError::ParseParameterError)
-        }
-    }
-
+impl<T: Read + Seek> C3dAdapter<T> {
     pub fn get_point_lables(&self) -> Option<Vec<String>> {
         let mut rv = None;
         if let Some(parameter) = self.parameter.as_ref() {
@@ -250,15 +243,13 @@ impl C3dAdapter {
         rv
     }
 
-    pub fn reader<'a, 'b, R: Seek + Read>(
-        &'a self,
-        handle: &'b mut R,
-    ) -> Result<C3dReader<'a, 'b, R>, ParserError> {
-        C3dReader::new(
-            self.header.as_ref().unwrap(),
-            self.parameter.as_ref().unwrap(),
-            handle,
-        )
+    pub fn reader<'a>(&'a self) -> Result<C3dReader<'a, T>, ParserError> {
+        if let Some(header) = self.header.as_ref() {
+            if let Some(parameter) = self.parameter.as_ref() {
+                return C3dReader::new(header, parameter, self.handle.borrow_mut());
+            }
+        }
+        Err(ParserError::MissingField)
     }
 }
 
@@ -703,17 +694,14 @@ mod tests {
 
     #[test]
     fn test_magic() -> Result<()> {
+        let mut buffer: Vec<u8> = vec![];
         let mut file = File::open("test_data/001.c3d")?;
+        file.read_to_end(&mut buffer)?;
 
-        let mut adapter = C3dAdapter::default();
-        adapter.get_header(&mut file)?;
-        adapter.get_parameter(&mut file)?;
+        let mut cur = Cursor::new(&mut buffer[..]);
 
-        for i in adapter
-            .reader(&mut file)?
-            .into_iter()
-            .filter_map(|val| val.2)
-        {
+        let adapter = C3dAdapter::new(&mut cur)?.construct()?;
+        for i in adapter.reader()?.into_iter().filter_map(|val| val.2) {
             i.values
                 .iter()
                 .zip(adapter.get_analog_lables().unwrap().iter())
