@@ -14,3 +14,7 @@ readme = "README.md"
 [dependencies]
 thiserror = "1.0.19"
 anyhow = "1.0.31"
+log = "0.4.8"
+
+[dev-dependencies]
+femme = "2.1.0"

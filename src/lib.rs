@@ -71,6 +71,10 @@ pub struct C3dReader<'a, R: Read + Seek> {
     points_buffer: Vec<u8>,
     analog_buffer: Vec<u8>,
     frame_idx: u16,
+    analog_unsigned: bool,
+    analog_offset: Option<Vec<f32>>,
+    analog_scale: Option<Vec<f32>>,
+    analog_gen_scale: Option<f32>,
 }
 
 impl<'a, R: Read + Seek> C3dReader<'a, R> {
@@ -83,6 +87,54 @@ impl<'a, R: Read + Seek> C3dReader<'a, R> {
         let points_buffer: Vec<u8> = vec![];
         let analog_buffer: Vec<u8> = vec![];
 
+        let analog_unsigned = parameter
+            .get("ANALOG:FORMAT")
+            .map(|param| {
+                param
+                    .parameter_data
+                    .values
+                    .iter()
+                    .filter_map(|v| v.as_char())
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>()
+            })
+            .and(Some("UNSIGNED"))
+            .is_some();
+
+        let analog_offset = parameter.get("ANALOG:OFFSET").map(|v| {
+            v.parameter_data
+                .values
+                .iter()
+                .filter_map(|arr| arr.as_i16())
+                .map(|a| *a as f32)
+                .collect::<Vec<f32>>()
+        });
+
+        let analog_scale = parameter.get("ANALOG:SCALE").map(|v| {
+            v.parameter_data
+                .values
+                .iter()
+                .filter_map(|arr| arr.as_f32())
+                .map(|a| *a)
+                .collect::<Vec<f32>>()
+        });
+
+        let analog_gen_scale = parameter
+            .get("ANALOG:GEN_SCALE")
+            .map(|v| {
+                v.parameter_data
+                    .values
+                    .iter()
+                    .filter_map(|arr| arr.as_f32())
+                    .map(|a| *a)
+                    .next()
+            })
+            .flatten();
+
+        log::debug!("analog offsets: {:?}", analog_offset);
+        log::debug!("scale factors: {:?}", analog_scale);
+        log::debug!("genral scale factor: {:?}", analog_gen_scale);
+
         Ok(C3dReader {
             header,
             parameter,
@@ -90,6 +142,10 @@ impl<'a, R: Read + Seek> C3dReader<'a, R> {
             points_buffer,
             analog_buffer,
             frame_idx: header.frame_first,
+            analog_unsigned,
+            analog_offset,
+            analog_scale,
+            analog_gen_scale,
         })
     }
 }
@@ -110,20 +166,6 @@ impl<'a, R: Read + Seek> Iterator for C3dReader<'a, R> {
         let point_scale = if is_float { 1.0 } else { point_scale.abs() };
 
         let analog_data_length = if is_float { 4 } else { 2 };
-        let is_unsigned = self
-            .parameter
-            .get("ANALOG:FORMAT")
-            .map(|param| {
-                param
-                    .parameter_data
-                    .values
-                    .iter()
-                    .filter_map(|v| v.as_char())
-                    .filter(|c| !c.is_whitespace())
-                    .collect::<String>()
-            })
-            .and(Some("UNSIGNED"))
-            .is_some();
 
         let points_n = 4 * self.header.point_counts;
         let analog_n = self.header.analog_counts;
@@ -191,27 +233,44 @@ impl<'a, R: Read + Seek> Iterator for C3dReader<'a, R> {
                 return None;
             }
 
-            let values: Vec<Vec<Box<dyn AnalogValue>>> = self
+            let mut values: Vec<f32> = self
                 .analog_buffer
                 .chunks_exact(analog_data_length as usize)
-                .filter_map(|arr| {
-                    Some(if is_float {
+                .map(|arr| {
+                    if is_float {
                         let mut buf = [0_u8; 4];
                         (arr.clone()).read_exact(&mut buf).unwrap();
-                        Box::new(f32::from_le_bytes(buf)) as Box<dyn AnalogValue>
+                        f32::from_le_bytes(buf)
                     } else {
                         let mut buf = [0_u8; 2];
-                        if is_unsigned {
+                        if self.analog_unsigned {
                             (arr.clone()).read_exact(&mut buf).unwrap();
-                            Box::new(u16::from_le_bytes(buf)) as Box<dyn AnalogValue>
+                            u16::from_le_bytes(buf) as f32
                         } else {
                             (arr.clone()).read_exact(&mut buf).unwrap();
-                            Box::new(i16::from_le_bytes(buf)) as Box<dyn AnalogValue>
+                            i16::from_le_bytes(buf) as f32
                         }
-                    })
+                    }
                 })
-                .map(|v| vec![v])
                 .collect();
+            if let Some(offsets) = self.analog_offset.as_ref() {
+                values.iter_mut().zip(offsets.iter()).for_each(|(v, off)| {
+                    *v -= *off;
+                });
+            }
+
+            if let Some(scales) = self.analog_scale.as_ref() {
+                values.iter_mut().zip(scales.iter()).for_each(|(v, off)| {
+                    *v *= *off;
+                });
+            }
+
+            if let Some(gen_scale) = self.analog_gen_scale.as_ref() {
+                values.iter_mut().for_each(|v| {
+                    *v *= *gen_scale;
+                });
+            }
+
             Some(AnalogData { values })
         } else {
             None
@@ -327,7 +386,6 @@ trait FromReader {
 impl FromReader for HeaderBlock {
     fn from_reader<R: Read + Seek>(r: &mut R) -> Self {
         let mut header: HeaderBlock = unsafe { mem::zeroed() };
-        // dbg!(&header);
         let header_size = mem::size_of::<HeaderBlock>();
 
         unsafe {
@@ -440,7 +498,10 @@ impl FromReader for ParameterBlock {
                         _ => None,
                     })
                     .collect();
-                let param_data = ParamData { values: datas };
+                let param_data = ParamData {
+                    values: datas,
+                    locked,
+                };
 
                 parameter_block_cursor.read_exact(&mut u8_buffer).unwrap();
                 let desc_chars_size = u8_buffer[0];
@@ -483,6 +544,7 @@ impl FromReader for ParameterBlock {
                     let new_group = GroupFormat {
                         name,
                         description: desc,
+                        locked,
                         ..Default::default()
                     };
                     groups.insert(group_id, new_group);
@@ -564,12 +626,14 @@ pub struct ParameterFormat {
 pub struct GroupFormat {
     name: String,
     description: String,
+    locked: bool,
     params: HashMap<String, ParameterFormat>,
 }
 
 #[derive(Debug)]
 pub struct ParamData {
     pub values: Vec<Box<dyn ParamValue>>,
+    locked: bool,
 }
 
 #[derive(Debug)]
@@ -579,7 +643,7 @@ pub struct PointData {
 
 #[derive(Debug)]
 pub struct AnalogData {
-    pub values: Vec<Vec<Box<dyn AnalogValue>>>,
+    pub values: Vec<f32>,
 }
 
 pub trait ParamValue: std::fmt::Debug + ParamClone {
@@ -633,97 +697,32 @@ impl ParamValue for u8 {
     }
 }
 
-pub trait DataClone {
-    fn clone_box(&self) -> Box<dyn DataValue>;
-}
-
-impl<T> DataClone for T
-where
-    T: 'static + DataValue + Clone,
-{
-    fn clone_box(&self) -> Box<dyn DataValue> {
-        Box::new(self.clone())
-    }
-}
-
-pub trait DataValue: std::fmt::Debug + DataClone {
-    fn as_f32(&self) -> Option<&f32> {
-        None
-    }
-    fn as_i16(&self) -> Option<&i16> {
-        None
-    }
-}
-
-impl DataValue for f32 {
-    fn as_f32(&self) -> Option<&f32> {
-        Some(self)
-    }
-}
-impl DataValue for i16 {
-    fn as_i16(&self) -> Option<&i16> {
-        Some(self)
-    }
-}
-
-pub trait AnalogClone {
-    fn clone_box(&self) -> Box<dyn AnalogValue>;
-}
-
-impl<T> AnalogClone for T
-where
-    T: 'static + AnalogValue + Clone,
-{
-    fn clone_box(&self) -> Box<dyn AnalogValue> {
-        Box::new(self.clone())
-    }
-}
-
-pub trait AnalogValue: std::fmt::Debug {
-    fn as_f32(&self) -> Option<&f32> {
-        None
-    }
-    fn as_i16(&self) -> Option<&i16> {
-        None
-    }
-    fn as_u16(&self) -> Option<&u16> {
-        None
-    }
-}
-
-impl AnalogValue for f32 {
-    fn as_f32(&self) -> Option<&f32> {
-        Some(self)
-    }
-}
-impl AnalogValue for u16 {
-    fn as_u16(&self) -> Option<&u16> {
-        Some(self)
-    }
-}
-impl AnalogValue for i16 {
-    fn as_i16(&self) -> Option<&i16> {
-        Some(self)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn setup() {
+        femme::with_level(log::LevelFilter::Debug);
+    }
+
     #[test]
     fn test_parser() -> Result<()> {
+        setup();
         let mut buffer: Vec<u8> = vec![];
 
+        // let mut file = File::open("/home/extraymond/Downloads/takes/takes/move2.c3d")?;
         let mut file = File::open("test_data/001.c3d")?;
+
         file.read_to_end(&mut buffer)?;
 
         let mut cur = Cursor::new(&mut buffer[..]);
 
         let adapter = C3dAdapter::new(&mut cur)?.construct()?;
 
-        for (_, p, _) in adapter.reader()?.into_iter() {
-            break;
+        for (_, p, a) in adapter.reader()?.into_iter() {
+            // if let Some(a) = a {
+            //     dbg!(a);
+            // }
         }
         Ok(())
     }
