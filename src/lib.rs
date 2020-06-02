@@ -31,7 +31,7 @@ pub struct C3dAdapter<T: Read + Seek> {
 }
 
 impl<T: Read + Seek> C3dAdapter<T> {
-    pub fn new(mut file: T) -> Result<Self> {
+    pub fn new(mut file: T) -> Result<Self, ParserError> {
         file.seek(SeekFrom::Start(0))?;
         let handle = Rc::new(RefCell::new(file));
 
@@ -42,9 +42,20 @@ impl<T: Read + Seek> C3dAdapter<T> {
         })
     }
 
-    pub fn construct(mut self) -> Result<Self> {
+    pub fn construct(mut self) -> Result<Self, ParserError> {
         let header = HeaderBlock::from_reader(&mut *self.handle.borrow_mut());
         let parameter = ParameterBlock::from_reader(&mut *self.handle.borrow_mut());
+
+        // 0x50 if header is of correct format.
+        if header.magic_word != 0x50 {
+            return Err(ParserError::UnmatchMagic);
+        }
+
+        // 0x50 + 4 if parameter is of correct format.
+        if parameter.header.magic_word != 0x50 + 4 {
+            dbg!(parameter.header.magic_word);
+            return Err(ParserError::UnmatchMagic);
+        }
 
         self.header.replace(header);
         self.parameter.replace(parameter);
@@ -92,10 +103,11 @@ impl<'a, R: Read + Seek> Iterator for C3dReader<'a, R> {
         }
 
         let point_scale = self.header.scale;
-        let is_float = point_scale < 0.0;
+        let is_float = point_scale <= 0.0;
 
         let point_data_length = if is_float { 4 } else { 2 };
-        let point_scale = if is_float { point_scale.abs() } else { 1.0 };
+
+        let point_scale = if is_float { 1.0 } else { point_scale.abs() };
 
         let analog_data_length = if is_float { 4 } else { 2 };
         let is_unsigned = self
@@ -123,26 +135,53 @@ impl<'a, R: Read + Seek> Iterator for C3dReader<'a, R> {
             return None;
         }
 
-        let values: Vec<Box<dyn DataValue>> = self
+        let values = self
             .points_buffer
-            .chunks_exact(point_data_length as usize)
-            .filter_map(|arr| {
-                Some(if is_float {
-                    let mut buf = [0_u8; 4];
-                    (arr.clone()).read_exact(&mut buf).unwrap();
-                    Box::new(f32::from_le_bytes(buf) * point_scale) as Box<dyn DataValue>
-                } else {
-                    let mut buf = [0_u8; 2];
-                    (arr.clone()).read_exact(&mut buf).unwrap();
-                    Box::new(i16::from_le_bytes(buf) * point_scale as i16)
-                })
+            .chunks_exact(4 * point_data_length as usize)
+            .map(|arr| {
+                let mut points_vec = [0_f32; 5];
+                let raw_vec = arr
+                    .chunks_exact(point_data_length as usize)
+                    .filter_map(|arr| {
+                        Some(if is_float {
+                            let mut buf = [0_u8; 4];
+                            arr.clone().read_exact(&mut buf).unwrap();
+                            f32::from_le_bytes(buf)
+                        } else {
+                            let mut buf = [0_u8; 2];
+                            arr.clone().read_exact(&mut buf).unwrap();
+                            i16::from_le_bytes(buf) as f32 * point_scale
+                        })
+                    })
+                    .collect::<Vec<f32>>();
+                points_vec[..4].copy_from_slice(&raw_vec);
+                points_vec
             })
-            .collect();
+            .map(|mut arr| {
+                let fourth = &arr[3];
 
-        let values = values
-            .chunks_exact(4)
-            .map(|v| v.iter().map(|v| v.clone_box()).collect())
-            .collect();
+                if *fourth <= -0.01_f32 {
+                    arr[3..5].iter_mut().for_each(|v| {
+                        *v = -0.01_f32;
+                    });
+                } else {
+                    let err = arr[3] as i16;
+                    // the right eight bits are for error estimation.
+                    arr[3] = (err & 0xff) as f32 * self.header.scale.abs();
+
+                    // the left eight bits are for reporting total number of camera that obsered
+                    arr[4] = (8..17)
+                        .map(|idx| {
+                            // camera mask to check wheter the bits are sets
+                            let mask = idx << 8;
+
+                            (err & mask) as f32
+                        })
+                        .sum();
+                }
+                arr
+            })
+            .collect::<Vec<_>>();
 
         let point_data = PointData { values };
         let analog_data = if analog_n > 0 {
@@ -246,7 +285,8 @@ impl<T: Read + Seek> C3dAdapter<T> {
     pub fn reader<'a>(&'a self) -> Result<C3dReader<'a, T>, ParserError> {
         if let Some(header) = self.header.as_ref() {
             if let Some(parameter) = self.parameter.as_ref() {
-                return C3dReader::new(header, parameter, self.handle.borrow_mut());
+                let handle = self.handle.borrow_mut();
+                return C3dReader::new(header, parameter, handle);
             }
         }
         Err(ParserError::MissingField)
@@ -502,29 +542,8 @@ struct ParameterBlockHeader {
     reserved_one: u8,
     reserved_two: u8,
     parameter_block_counts: u8,
-    magic_number: u8,
+    magic_word: u8,
 }
-
-// #[derive(Debug)]
-// pub struct GroupParse {
-//     name_chars_size: u8,
-//     id: i8,
-//     name: String,
-//     offset: i16,
-//     desc_chars_size: u8,
-//     description: String,
-//     params: HashMap<String, Parameter>,
-// }
-
-// pub struct GroupFormat {
-//     // indicates "locked" if value is negative.
-//     name_chars_size: i8,
-//     id: i8,
-//     name: String,
-//     offset: i16,
-//     desc_chars_size: u8,
-//     description: String,
-// }
 
 #[derive(Debug)]
 pub struct ParameterFormat {
@@ -555,7 +574,7 @@ pub struct ParamData {
 
 #[derive(Debug)]
 pub struct PointData {
-    pub values: Vec<Vec<Box<dyn DataValue>>>,
+    pub values: Vec<[f32; 5]>,
 }
 
 #[derive(Debug)]
@@ -693,24 +712,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_magic() -> Result<()> {
+    fn test_parser() -> Result<()> {
         let mut buffer: Vec<u8> = vec![];
+
         let mut file = File::open("test_data/001.c3d")?;
         file.read_to_end(&mut buffer)?;
 
         let mut cur = Cursor::new(&mut buffer[..]);
 
         let adapter = C3dAdapter::new(&mut cur)?.construct()?;
-        for i in adapter.reader()?.into_iter().filter_map(|val| val.2) {
-            i.values
-                .iter()
-                .zip(adapter.get_analog_lables().unwrap().iter())
-                .filter(|(_, k)| k.contains("Tracker"))
-                .for_each(|v| {
-                    println!("{}: {:?}", v.1, &v.0[0]);
-                })
-        }
 
+        for (_, p, _) in adapter.reader()?.into_iter() {
+            break;
+        }
         Ok(())
     }
 }
