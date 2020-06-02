@@ -16,7 +16,7 @@ use thiserror::Error;
 pub enum ParserError {
     #[error("magic word not unmatched, might not be a c3d file")]
     UnmatchMagic,
-    #[error("unable to parse paramter file")]
+    #[error("unable to parse paramter block")]
     ParseParameterError,
     #[error("io error")]
     IoError(#[from] io::Error),
@@ -357,17 +357,17 @@ impl<T: Read + Seek> C3dAdapter<T> {
 pub struct HeaderBlock {
     parameter_start: u8,
     magic_word: u8,
-    point_counts: u16,
-    analog_counts: u16,
+    pub point_counts: u16,
+    pub analog_counts: u16,
     // index start from 1
-    frame_first: u16,
+    pub frame_first: u16,
     // index start from 1
-    frame_last: u16,
-    max_gap: u16,
-    scale: f32,
+    pub frame_last: u16,
+    pub max_gap: u16,
+    pub scale: f32,
     data_start: u16,
-    analog_per_frame: u16,
-    frame_rate: f32,
+    pub analog_per_frame: u16,
+    pub frame_rate: f32,
     reserved: [u8; 274],
     event_lables_long: u16,
     event_counts: u16,
@@ -498,10 +498,7 @@ impl FromReader for ParameterBlock {
                         _ => None,
                     })
                     .collect();
-                let param_data = ParamData {
-                    values: datas,
-                    locked,
-                };
+                let param_data = ParamData { values: datas };
 
                 parameter_block_cursor.read_exact(&mut u8_buffer).unwrap();
                 let desc_chars_size = u8_buffer[0];
@@ -519,6 +516,7 @@ impl FromReader for ParameterBlock {
                     parameter_data: param_data,
                     desc_chars_size,
                     description: desc,
+                    locked,
                 };
 
                 let group_id = id as u8;
@@ -569,7 +567,7 @@ impl FromReader for ParameterBlock {
 #[derive(Debug)]
 pub struct ParameterBlock {
     header: ParameterBlockHeader,
-    groups: HashMap<String, GroupFormat>,
+    pub groups: HashMap<String, GroupFormat>,
 }
 
 impl ParameterBlock {
@@ -612,28 +610,28 @@ pub struct ParameterFormat {
     // indicates "locked" if value is negative.
     name_chars_size: u8,
     id: i8,
-    name: String,
+    pub name: String,
     offset: i16,
-    data_length: i8,
-    num_dimensions: u8,
-    dimensions: Vec<u8>,
-    parameter_data: ParamData,
+    pub data_length: i8,
+    pub num_dimensions: u8,
+    pub dimensions: Vec<u8>,
+    pub parameter_data: ParamData,
     desc_chars_size: u8,
-    description: String,
+    pub description: String,
+    pub locked: bool,
 }
 
 #[derive(Default, Debug)]
 pub struct GroupFormat {
-    name: String,
-    description: String,
-    locked: bool,
-    params: HashMap<String, ParameterFormat>,
+    pub name: String,
+    pub description: String,
+    pub locked: bool,
+    pub params: HashMap<String, ParameterFormat>,
 }
 
 #[derive(Debug)]
 pub struct ParamData {
     pub values: Vec<Box<dyn ParamValue>>,
-    locked: bool,
 }
 
 #[derive(Debug)]
@@ -710,10 +708,19 @@ mod tests {
         set_logger();
 
         let mut file = File::open("test_data/vicon_trial.c3d")?;
-        let adapter = C3dAdapter::new(&mut file)?.construct()?;
+
+        let mut buf: Vec<u8> = vec![];
+        file.read_to_end(&mut buf)?;
+
+        let mut cursor = Cursor::new(&buf[..]);
+
+        let adapter = C3dAdapter::new(&mut cursor)?.construct()?;
         for (i, p, a) in adapter.reader()?.into_iter() {
             dbg!(i, p, a);
         }
+
+        adapter.get_point_lables().unwrap();
+        adapter.get_analog_lables().unwrap();
 
         let mut file = File::open("test_data/motion_shadow.c3d")?;
         let adapter = C3dAdapter::new(&mut file)?.construct()?;
