@@ -701,29 +701,26 @@ impl ParamValue for u8 {
 mod tests {
     use super::*;
 
-    fn setup() {
+    fn set_logger() {
         femme::with_level(log::LevelFilter::Debug);
     }
 
     #[test]
     fn test_parser() -> Result<()> {
-        setup();
-        let mut buffer: Vec<u8> = vec![];
+        set_logger();
 
-        // let mut file = File::open("/home/extraymond/Downloads/takes/takes/move2.c3d")?;
-        let mut file = File::open("test_data/001.c3d")?;
-
-        file.read_to_end(&mut buffer)?;
-
-        let mut cur = Cursor::new(&mut buffer[..]);
-
-        let adapter = C3dAdapter::new(&mut cur)?.construct()?;
-
-        for (_, p, a) in adapter.reader()?.into_iter() {
-            // if let Some(a) = a {
-            //     dbg!(a);
-            // }
+        let mut file = File::open("test_data/vicon_trial.c3d")?;
+        let adapter = C3dAdapter::new(&mut file)?.construct()?;
+        for (i, p, a) in adapter.reader()?.into_iter() {
+            dbg!(i, p, a);
         }
+
+        let mut file = File::open("test_data/motion_shadow.c3d")?;
+        let adapter = C3dAdapter::new(&mut file)?.construct()?;
+        for (i, p, a) in adapter.reader()?.into_iter() {
+            dbg!(i, p, a);
+        }
+
         Ok(())
     }
 }
