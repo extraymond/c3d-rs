@@ -8,6 +8,7 @@ license = "Apache-2.0/MIT"
 repository = "https://github.com/extraymond/c3d-rs"
 homepage = "https://github.com/extraymond/c3d-rs"
 readme = "README.md"
+include = ["src/lib.rs", "README.md"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
