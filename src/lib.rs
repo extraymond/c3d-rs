@@ -284,7 +284,7 @@ impl<'a, R: Read + Seek> Iterator for C3dReader<'a, R> {
 }
 
 impl<T: Read + Seek> C3dAdapter<T> {
-    pub fn get_point_lables(&self) -> Option<Vec<String>> {
+    pub fn get_point_labels(&self) -> Option<Vec<String>> {
         let mut rv = None;
         if let Some(parameter) = self.parameter.as_ref() {
             rv = parameter.get("POINT:LABELS").map(|param| {
@@ -304,7 +304,7 @@ impl<T: Read + Seek> C3dAdapter<T> {
         rv
     }
 
-    pub fn get_analog_lables(&self) -> Option<Vec<String>> {
+    pub fn get_analog_labels(&self) -> Option<Vec<String>> {
         let mut rv = None;
         if let Some(parameter) = self.parameter.as_ref() {
             if let Some(analog) = parameter.groups.get("ANALOG") {
@@ -719,8 +719,8 @@ mod tests {
             dbg!(i, p, a);
         }
 
-        adapter.get_point_lables().unwrap();
-        adapter.get_analog_lables().unwrap();
+        adapter.get_point_labels().unwrap();
+        adapter.get_analog_labels().unwrap();
 
         let mut file = File::open("test_data/motion_shadow.c3d")?;
         let adapter = C3dAdapter::new(&mut file)?.construct()?;
